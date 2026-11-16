@@ -1,0 +1,187 @@
+package xmlenc
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/beevik/etree"
+)
+
+// GCM implements Decrypter and Encrypter for block ciphers in struct mode
+type GCM struct {
+	// Rand, if non-nil, is the source of the nonce and the element ID that
+	// Encrypt generates. If nil, crypto/rand is used (through the
+	// deprecated package-level RandReader). RSA.Encrypt uses its own Rand
+	// when this one is nil.
+	Rand io.Reader
+
+	keySize   int
+	algorithm string
+	cipher    func([]byte) (cipher.Block, error)
+}
+
+// KeySize returns the length of the key required.
+func (e GCM) KeySize() int {
+	return e.keySize
+}
+
+// Algorithm returns the name of the algorithm, as will be found
+// in an xenc:EncryptionMethod element.
+func (e GCM) Algorithm() string {
+	return e.algorithm
+}
+
+// Encrypt encrypts plaintext with key, which should be a []byte of length
+// KeySize(), and returns an xenc:EncryptedData element.
+//
+// Pass a nil nonce, and Encrypt generates a random one from Rand,
+// which is what callers should do. A non-nil nonce must be NonceSize (12)
+// bytes and must never be used again with the same key: reusing a GCM nonce
+// reveals the XOR of the two plaintexts and lets anyone forge messages
+// under that key. It is accepted only for reproducible test vectors.
+func (e GCM) Encrypt(key interface{}, plaintext []byte, nonce []byte) (*etree.Element, error) {
+	return e.encryptWithRand(nil, key, plaintext, nonce)
+}
+
+func (e GCM) encryptWithRand(fallback io.Reader, key interface{}, plaintext []byte, nonce []byte) (*etree.Element, error) {
+	randReader := randOrDefault(e.Rand, fallback)
+	keyBuf, ok := key.([]byte)
+	if !ok {
+		return nil, ErrIncorrectKeyType("[]byte")
+	}
+	if len(keyBuf) != e.keySize {
+		return nil, ErrIncorrectKeyLength(e.keySize)
+	}
+
+	block, err := e.cipher(keyBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	encryptedDataEl := etree.NewElement("xenc:EncryptedData")
+	encryptedDataEl.CreateAttr("xmlns:xenc", "http://www.w3.org/2001/04/xmlenc#")
+	{
+		randBuf := make([]byte, 16)
+		if _, err := io.ReadFull(randReader, randBuf); err != nil {
+			return nil, err
+		}
+		encryptedDataEl.CreateAttr("Id", fmt.Sprintf("_%x", randBuf))
+	}
+
+	em := encryptedDataEl.CreateElement("xenc:EncryptionMethod")
+	em.CreateAttr("Algorithm", e.algorithm)
+	em.CreateAttr("xmlns:xenc", "http://www.w3.org/2001/04/xmlenc#")
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	if nonce == nil {
+		// generate random nonce when it's nil
+		nonce = make([]byte, aesgcm.NonceSize())
+		if _, err := io.ReadFull(randReader, nonce); err != nil {
+			return nil, err
+		}
+	} else if len(nonce) != aesgcm.NonceSize() {
+		return nil, fmt.Errorf("nonce must be %d bytes", aesgcm.NonceSize())
+	}
+
+	// The nonce is prefixed to the ciphertext, which is what Decrypt reads back.
+	// GCM does not use CBC padding, and Seal must see the caller's plaintext.
+	sealed := aesgcm.Seal(nil, nonce, plaintext, nil)
+	text := make([]byte, 0, len(nonce)+len(sealed))
+	text = append(text, nonce...)
+	text = append(text, sealed...)
+
+	cd := encryptedDataEl.CreateElement("xenc:CipherData")
+	cd.CreateAttr("xmlns:xenc", "http://www.w3.org/2001/04/xmlenc#")
+	cd.CreateElement("xenc:CipherValue").SetText(base64.StdEncoding.EncodeToString(text))
+	return encryptedDataEl, nil
+}
+
+// Decrypt decrypts an encrypted element with key. If the ciphertext contains an
+// EncryptedKey element, then the type of `key` is determined by the registered
+// Decryptor for the EncryptedKey element. Otherwise, `key` must be a []byte of
+// length KeySize().
+func (e GCM) Decrypt(key interface{}, ciphertextEl *etree.Element) ([]byte, error) {
+	if encryptedKeyEl := ciphertextEl.FindElement("./KeyInfo/EncryptedKey"); encryptedKeyEl != nil {
+		var err error
+		key, err = Decrypt(key, encryptedKeyEl)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	keyBuf, ok := key.([]byte)
+
+	if !ok {
+		return nil, ErrIncorrectKeyType("[]byte")
+	}
+	if len(keyBuf) != e.KeySize() {
+		return nil, ErrIncorrectKeyLength(e.KeySize())
+	}
+
+	block, err := e.cipher(keyBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	aesgcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+
+	ciphertext, err := getCiphertext(ciphertextEl)
+	if err != nil {
+		return nil, err
+	}
+
+	// The nonce is prefixed and the tag appended. Anything shorter is malformed
+	// and would make the slicing below panic.
+	if len(ciphertext) < aesgcm.NonceSize()+aesgcm.Overhead() {
+		return nil, errors.New("ciphertext too short")
+	}
+
+	nonce := ciphertext[:aesgcm.NonceSize()]
+	text := ciphertext[aesgcm.NonceSize():]
+
+	plainText, err := aesgcm.Open(nil, nonce, text, nil)
+	if err != nil {
+		return nil, err
+	}
+	return plainText, nil
+}
+
+var (
+	// AES128GCM implements AES128-GCM mode for encryption and decryption
+	AES128GCM BlockCipher = GCM{
+		keySize:   16,
+		algorithm: "http://www.w3.org/2009/xmlenc11#aes128-gcm",
+		cipher:    aes.NewCipher,
+	}
+
+	// AES192GCM implements AES192-GCM mode for encryption and decryption
+	AES192GCM BlockCipher = GCM{
+		keySize:   24,
+		algorithm: "http://www.w3.org/2009/xmlenc11#aes192-gcm",
+		cipher:    aes.NewCipher,
+	}
+
+	// AES256GCM implements AES256-GCM mode for encryption and decryption
+	AES256GCM BlockCipher = GCM{
+		keySize:   32,
+		algorithm: "http://www.w3.org/2009/xmlenc11#aes256-gcm",
+		cipher:    aes.NewCipher,
+	}
+)
+
+func init() {
+	RegisterDecrypter(AES128GCM)
+	RegisterDecrypter(AES192GCM)
+	RegisterDecrypter(AES256GCM)
+}

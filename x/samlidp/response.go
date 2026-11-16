@@ -1,0 +1,446 @@
+package samlidp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/crewjam/saml"
+	"github.com/crewjam/saml/internal/timelimit"
+)
+
+// Subject is what the identity provider asserts about the user it has
+// authenticated: who they are, how and when they logged in, and their
+// attributes.
+type Subject struct {
+	// NameID identifies the user to the SP. It is required.
+	NameID string
+
+	// NameIDFormat is the format of NameID, such as
+	// saml.PersistentNameIDFormat or saml.EmailAddressNameIDFormat. Set it
+	// to say what NameID is. The default is saml.UnspecifiedNameIDFormat
+	// (saml-core §8.3.1), which promises the SP nothing about the
+	// identifier, and with which the NameID is not qualified. Unlike
+	// package saml, which defaults to transient, this package does not
+	// assume that NameID is a new, one-time identifier: an SP takes a
+	// transient NameID to change at each login (saml-core §8.3.8), so a
+	// stable user ID sent as transient misleads it. Use
+	// saml.TransientNameIDFormat only for a NameID made anew for each
+	// login, and saml.PersistentNameIDFormat for an opaque identifier
+	// kept for the user and the SP. For the persistent and transient
+	// formats, the NameID is qualified with the IdP's and the SP's entity
+	// IDs (saml-core §8.3.7, §8.3.8).
+	//
+	// An SP whose request asks for a particular format, as one of
+	// x/samlsp asks for transient by default, is answered with the
+	// status InvalidNameIDPolicy unless NameIDFormat is that format.
+	NameIDFormat saml.NameIDFormat
+
+	// AuthnInstant is when the IdP authenticated the user. It is required.
+	// For a login from an existing session, it is when that session
+	// began, not now.
+	AuthnInstant time.Time
+
+	// AuthnContextClassRef is how the IdP authenticated the user. The
+	// default is saml.AuthnContextPasswordProtectedTransport. It must
+	// satisfy the AuthnRequest's AuthnContextClasses.
+	AuthnContextClassRef saml.AuthnContextClass
+
+	// SessionIndex, if not empty, names the user's session at the IdP, for
+	// single logout. The SP sees it, so it must be opaque, not the IdP's
+	// session token or anything that would let the session be taken over,
+	// and should differ from one SP to another, so that SPs cannot
+	// correlate the user by it (saml-core §2.7.2): for example, an HMAC,
+	// under a key of the IdP, of the session's ID and the SP's entity ID.
+	SessionIndex string
+
+	// SessionNotOnOrAfter, if not zero, is when the SP must end the
+	// session it creates from the assertion.
+	SessionNotOnOrAfter time.Time
+
+	// Attributes are the attributes the IdP sends about the user. Response
+	// sends them all, to whichever SP the request is from: choose them for
+	// the SP, or let ReleaseRequestedAttributesOnly keep only those that
+	// its metadata asks for.
+	Attributes []Attribute
+}
+
+// Attribute is a SAML attribute, with its values as strings
+// (xs:string).
+type Attribute struct {
+	// Name identifies the attribute, as NameFormat says how to read it:
+	// for example "urn:oid:0.9.2342.19200300.100.1.3" (mail) with the
+	// NameFormat "urn:oasis:names:tc:SAML:2.0:attrname-format:uri". An
+	// empty NameFormat means unspecified.
+	Name       string
+	NameFormat string
+
+	// FriendlyName is an optional, human-readable form of Name, such as
+	// "mail".
+	FriendlyName string
+
+	// Values are the attribute's values.
+	Values []string
+}
+
+// encryptedNameIDFormat is the NameIDPolicy Format that asks for the
+// NameID to be encrypted (saml-core §3.4.1.1, §8.3.9).
+const encryptedNameIDFormat saml.NameIDFormat = "urn:oasis:names:tc:SAML:2.0:nameid-format:encrypted"
+
+// ResponseOption customizes Response and ErrorResponse.
+type ResponseOption interface {
+	applyResponse(*responseOptions)
+}
+
+type responseOptions struct {
+	custom  Binding
+	idp     []IdentityProviderOption
+	address string
+	modify  []func(*saml.Assertion) error
+	nonce   string
+
+	// requestedOnly is set by ReleaseRequestedAttributesOnly.
+	requestedOnly bool
+}
+
+type responseOptionFunc func(*responseOptions)
+
+func (f responseOptionFunc) applyResponse(o *responseOptions) { f(o) }
+
+// WithSubjectAddress sets the network address of the user's browser, as
+// the application sees it, which the assertion carries in its
+// SubjectConfirmationData and SubjectLocality (saml-core §2.4.1.2). Some
+// SPs check it against the address the Response arrives from. Without
+// it, the assertion carries none.
+func WithSubjectAddress(address string) ResponseOption {
+	return responseOptionFunc(func(o *responseOptions) { o.address = address })
+}
+
+// WithAssertion calls modify with the assertion before it is signed (and
+// encrypted), to set what has no option of its own, such as attributes
+// of a complex type or an AttributeStatement's encrypted attributes. An
+// error it returns is returned by Response.
+func WithAssertion(modify func(a *saml.Assertion) error) ResponseOption {
+	return responseOptionFunc(func(o *responseOptions) { o.modify = append(o.modify, modify) })
+}
+
+// WithScriptNonce sets the nonce attribute of the script that makes the
+// form of the Response submit itself. Use it when a
+// Content-Security-Policy set by your application allows scripts by
+// nonce. Message.Write's own policy allows the script by its hash.
+func WithScriptNonce(nonce string) ResponseOption {
+	return responseOptionFunc(func(o *responseOptions) { o.nonce = nonce })
+}
+
+// Response returns the Response that tells the service provider who the
+// user is, as the answer to req, to send with Message.Write. The assertion
+// is signed, and so is the Response (to sign only one of them, as some
+// IdPs do, set saml.IdentityProvider.ResponseSigning with
+// WithIdentityProvider; the assertion is signed all the same for an SP
+// whose metadata says WantAssertionsSigned="true"); the assertion is
+// encrypted if the SP's metadata publishes an encryption certificate.
+//
+// The service provider is looked up again, and req.ACSURL must still be
+// one of its assertion consumer services.
+//
+// The request may ask for what the IdP will not assert: a NameID format
+// other than subject.NameIDFormat, an SPNameQualifier that WithAffiliation
+// does not allow, an authentication context that
+// subject.AuthnContextClassRef does not satisfy, or a user other than
+// subject. It may ask for an encrypted NameID: Response issues the NameID
+// as an EncryptedID (saml-core §2.2.4, §8.3.9), and refuses the request if
+// the SP's metadata publishes no encryption certificate. The error then
+// matches *saml.StatusError; send it to the SP with ErrorResponse.
+// WithAssertion sees the plaintext NameID, which is encrypted after it.
+//
+// If req.ForceAuthn is set, subject.AuthnInstant must not be before
+// req.IssueInstant, give or take the clock skew (see WithClockSkew, or the
+// MaxClockSkew an IdentityProviderOption sets): Response returns an error
+// otherwise.
+//
+// Response does not prevent req from being answered twice: once it is
+// answered, delete the AuthnRequest where it was kept.
+func (c *Config) Response(ctx context.Context, req *AuthnRequest, subject Subject, opts ...ResponseOption) (*Message, error) {
+	o := newResponseOptions(opts)
+	if subject.NameID == "" {
+		return nil, errors.New("samlidp: the subject has no NameID")
+	}
+	if subject.AuthnInstant.IsZero() {
+		return nil, errors.New("samlidp: the subject has no AuthnInstant")
+	}
+	ireq, err := c.answer(ctx, req, o)
+	if err != nil {
+		return nil, err
+	}
+	if req.ForceAuthn && subject.AuthnInstant.Before(req.IssueInstant.Add(-timelimit.IDPClockSkew(ireq.IDP))) {
+		return nil, fmt.Errorf("samlidp: the request asks for a new authentication (ForceAuthn), but the subject's AuthnInstant %s is before the request was issued, at %s",
+			subject.AuthnInstant.UTC().Format(time.RFC3339), req.IssueInstant.UTC().Format(time.RFC3339))
+	}
+	if err := c.spNameQualifierError(ctx, ireq.IDP, req); err != nil {
+		return nil, err
+	}
+
+	nameIDFormat := subject.NameIDFormat
+	if nameIDFormat == "" {
+		nameIDFormat = saml.UnspecifiedNameIDFormat
+	}
+	session := &saml.Session{
+		NameID:               subject.NameID,
+		NameIDFormat:         string(nameIDFormat),
+		Index:                subject.SessionIndex,
+		CreateTime:           subject.AuthnInstant,
+		AuthnContextClassRef: string(subject.AuthnContextClassRef),
+	}
+	if err := (saml.DefaultAssertionMaker{}).MakeAssertion(ireq, session); err != nil {
+		return nil, err
+	}
+	a := ireq.Assertion
+	// DefaultAssertionMaker makes attributes of its own from the fields of
+	// the Session, which are left empty: the subject's are the only ones.
+	a.AttributeStatements = nil
+	attrs := subject.Attributes
+	if o.requestedOnly {
+		requested, err := requestedAttributes(ireq.SPSSODescriptor, req.ServiceProvider, req.AttributeConsumingServiceIndex)
+		if err != nil {
+			return nil, err
+		}
+		attrs = FilterAttributes(requested, attrs)
+	}
+	if len(attrs) > 0 {
+		a.AttributeStatements = []saml.AttributeStatement{{Attributes: samlAttributes(attrs)}}
+	}
+	if !subject.SessionNotOnOrAfter.IsZero() {
+		t := subject.SessionNotOnOrAfter
+		for i := range a.AuthnStatements {
+			a.AuthnStatements[i].SessionNotOnOrAfter = &t
+		}
+	}
+	for _, modify := range o.modify {
+		if err := modify(a); err != nil {
+			return nil, err
+		}
+	}
+	if err := ireq.CheckRequestSubject(); err != nil {
+		return nil, err
+	}
+	// The participant is identified by the plaintext NameID, which
+	// MakeAssertionEl replaces with an EncryptedID if the request asks.
+	// The participant names the session as the SP received it: a
+	// WithAssertion may have changed the SessionIndex.
+	participant := &saml.SessionParticipant{
+		ServiceProviderID: ireq.ServiceProviderMetadata.EntityID,
+		SessionIndex:      subject.SessionIndex,
+	}
+	if len(a.AuthnStatements) > 0 {
+		participant.SessionIndex = a.AuthnStatements[0].SessionIndex
+	}
+	if a.Subject != nil && a.Subject.NameID != nil {
+		participant.NameID = *a.Subject.NameID
+	}
+	if err := ireq.MakeAssertionEl(); err != nil {
+		return nil, err
+	}
+	// Package saml issues an EncryptedID for the encrypted format only if
+	// the SP has an encryption key (saml-core §3.4.1.1, §8.3.9).
+	if ireq.IDP.EnforceNameIDPolicy && req.NameIDFormat == encryptedNameIDFormat && (a.Subject == nil || a.Subject.EncryptedID == nil) {
+		return nil, &saml.StatusError{
+			TopLevel:    saml.StatusRequester,
+			SecondLevel: saml.StatusInvalidNameIDPolicy,
+			Message:     "an encrypted name identifier needs an encryption key in the service provider's metadata",
+		}
+	}
+	if err := ireq.MakeResponse(); err != nil {
+		return nil, err
+	}
+	msg, err := c.sendResponse(ctx, ireq, o)
+	if err != nil {
+		return nil, err
+	}
+	msg.Participant = participant
+	return msg, nil
+}
+
+// ErrorResponse returns a Response to req that carries status and no
+// assertion, to send with Message.Write: for example, with
+// saml.StatusResponder and the second-level status saml.StatusNoPassive,
+// for an IsPassive request when the user has no session, or
+// saml.StatusAuthnFailed or saml.StatusRequestDenied. Its Message is read
+// by the SP, so it should not reveal anything the SP should not know.
+//
+// Use it too for the *saml.StatusError that ParseAuthnRequest and
+// Response return.
+//
+// An error Response is posted, never sent with a custom Binding such as
+// the HTTP-Artifact binding of x/samlidp/idpartifact, which would keep it
+// in a store until the SP fetched it. An error Response is what anyone
+// can get for an SP that does not sign its requests, as often as they
+// like, by sending its AuthnRequest with IsPassive, for example, so it
+// must not take up room that the Responses of real logins need. If
+// req.ACSBinding is that of the custom Binding, the Response is posted to
+// the SP's default assertion consumer service with the HTTP-POST or
+// HTTP-POST-SimpleSign binding instead (saml-metadata §2.2.3). If the SP
+// has none, the custom Binding is used only if req.Signed, since a signed
+// request is accepted only once, and so each error Response it stores
+// costs the SP's signature; otherwise ErrorResponse fails with an error
+// matching saml.ErrUnknownAssertionConsumerService.
+func (c *Config) ErrorResponse(ctx context.Context, req *AuthnRequest, status *saml.StatusError, opts ...ResponseOption) (*Message, error) {
+	if status == nil {
+		return nil, errors.New("samlidp: ErrorResponse needs a status")
+	}
+	o := newResponseOptions(opts)
+	ireq, err := c.answer(ctx, req, o)
+	if err != nil {
+		return nil, err
+	}
+	if !sendable(ireq.ACSEndpoint.Binding) {
+		// Choose before the Response is made, so that a request that
+		// cannot be answered costs no signature.
+		d, ep := defaultACSWithBinding(ireq.ServiceProviderMetadata, sendable)
+		switch {
+		case ep != nil:
+			ireq.SPSSODescriptor, ireq.ACSEndpoint = d, ep
+		case !req.Signed:
+			return nil, fmt.Errorf("samlidp: service provider %q has no assertion consumer service to post an error response to, and the request was not signed, so it is not sent with binding %s: %w",
+				req.ServiceProvider, ireq.ACSEndpoint.Binding, saml.ErrUnknownAssertionConsumerService)
+		}
+	}
+	if err := ireq.MakeErrorResponse(status.TopLevel, status.SecondLevel, status.Message); err != nil {
+		return nil, err
+	}
+	return c.sendResponse(ctx, ireq, o)
+}
+
+// sendResponse returns the Message that sends the Response of ireq, which
+// MakeResponse or MakeErrorResponse has made: with the custom Binding of
+// o if the ACS has its binding, and otherwise posted.
+func (c *Config) sendResponse(ctx context.Context, ireq *saml.IdpAuthnRequest, o responseOptions) (*Message, error) {
+	if o.custom == nil || ireq.ACSEndpoint.Binding != o.custom.URI() {
+		return postResponse(ireq, o.nonce)
+	}
+	return o.custom.Encode(ctx, &OutboundMessage{
+		ID:              ireq.ResponseEl.SelectAttrValue("ID", ""),
+		InResponseTo:    ireq.Request.ID,
+		Binding:         ireq.ACSEndpoint.Binding,
+		Destination:     ireq.ACSEndpoint.Location,
+		ServiceProvider: ireq.ServiceProviderMetadata.EntityID,
+		Param:           "SAMLResponse",
+		RelayState:      ireq.RelayState,
+		ScriptNonce:     o.nonce,
+		Element:         ireq.ResponseEl,
+	})
+}
+
+func newResponseOptions(opts []ResponseOption) responseOptions {
+	var o responseOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt.applyResponse(&o)
+		}
+	}
+	return o
+}
+
+// answer returns the saml.IdpAuthnRequest that answers req: with the
+// IdentityProvider of the call, the SP's metadata, and its assertion
+// consumer service at req.ACSURL.
+func (c *Config) answer(ctx context.Context, req *AuthnRequest, o responseOptions) (*saml.IdpAuthnRequest, error) {
+	if req == nil {
+		return nil, errors.New("samlidp: nil AuthnRequest")
+	}
+	if !sendable(req.ACSBinding) && (o.custom == nil || req.ACSBinding != o.custom.URI()) {
+		return nil, fmt.Errorf("samlidp: cannot send a response with binding %q (see WithCustomBinding)", req.ACSBinding)
+	}
+	md, err := lookupServiceProvider(ctx, c.serviceProviders, req.ServiceProvider, c.clock)
+	if err != nil {
+		return nil, err
+	}
+	request, err := req.samlRequest()
+	if err != nil {
+		return nil, err
+	}
+	idp, err := c.checkedIdentityProvider(o.idp)
+	if err != nil {
+		return nil, err
+	}
+	ireq := &saml.IdpAuthnRequest{
+		IDP:                     idp,
+		HTTPRequest:             (&http.Request{RemoteAddr: o.address}).WithContext(ctx),
+		RelayState:              req.RelayState,
+		Request:                 request,
+		ServiceProviderMetadata: md,
+		Now:                     clockNow(idp.Clock),
+	}
+	ireq.SPSSODescriptor, ireq.ACSEndpoint = findACS(md, req.ACSURL, req.ACSBinding)
+	if ireq.ACSEndpoint == nil {
+		return nil, fmt.Errorf("samlidp: service provider %q has no assertion consumer service %s with binding %s: %w",
+			req.ServiceProvider, req.ACSURL, req.ACSBinding, saml.ErrUnknownAssertionConsumerService)
+	}
+	return ireq, nil
+}
+
+// findACS returns copies of the assertion consumer service of md at
+// location with binding, and of its SPSSODescriptor, or nils.
+func findACS(md *saml.EntityDescriptor, location, binding string) (*saml.SPSSODescriptor, *saml.IndexedEndpoint) {
+	return firstACS(md, func(ep *saml.IndexedEndpoint) bool { return ep.Location == location && ep.Binding == binding })
+}
+
+// defaultACSWithBinding returns copies of the default assertion consumer
+// service of md among those whose binding has, and of its SPSSODescriptor,
+// or nils. The default is the first one marked isDefault="true", else the
+// first one not marked isDefault="false", else the first one
+// (saml-metadata §2.2.3), as package saml chooses among the bindings it
+// posts with.
+func defaultACSWithBinding(md *saml.EntityDescriptor, has func(binding string) bool) (*saml.SPSSODescriptor, *saml.IndexedEndpoint) {
+	if d, ep := firstACS(md, func(ep *saml.IndexedEndpoint) bool {
+		return has(ep.Binding) && ep.IsDefault != nil && *ep.IsDefault
+	}); ep != nil {
+		return d, ep
+	}
+	if d, ep := firstACS(md, func(ep *saml.IndexedEndpoint) bool {
+		return has(ep.Binding) && (ep.IsDefault == nil || *ep.IsDefault)
+	}); ep != nil {
+		return d, ep
+	}
+	return firstACS(md, func(ep *saml.IndexedEndpoint) bool { return has(ep.Binding) })
+}
+
+// firstACS returns copies of the first assertion consumer service of md
+// for which match returns true, and of its SPSSODescriptor, or nils. A
+// service whose location is not an http or https URL is skipped.
+func firstACS(md *saml.EntityDescriptor, match func(*saml.IndexedEndpoint) bool) (*saml.SPSSODescriptor, *saml.IndexedEndpoint) {
+	for _, d := range md.SPSSODescriptors {
+		for _, ep := range d.AssertionConsumerServices {
+			if !match(&ep) {
+				continue
+			}
+			u, err := url.Parse(ep.Location)
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+				continue
+			}
+			d, ep := d, ep
+			return &d, &ep
+		}
+	}
+	return nil, nil
+}
+
+// samlAttributes returns attrs as saml.Attributes, with xs:string values.
+func samlAttributes(attrs []Attribute) []saml.Attribute {
+	out := make([]saml.Attribute, 0, len(attrs))
+	for _, attr := range attrs {
+		values := make([]saml.AttributeValue, 0, len(attr.Values))
+		for _, v := range attr.Values {
+			values = append(values, saml.AttributeValue{Type: "xs:string", Value: v})
+		}
+		out = append(out, saml.Attribute{
+			Name:         attr.Name,
+			NameFormat:   attr.NameFormat,
+			FriendlyName: attr.FriendlyName,
+			Values:       values,
+		})
+	}
+	return out
+}

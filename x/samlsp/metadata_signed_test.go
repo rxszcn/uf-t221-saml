@@ -1,0 +1,226 @@
+package samlsp_test
+
+import (
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/xml"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/beevik/etree"
+	dsig "github.com/russellhaering/goxmldsig"
+
+	"github.com/crewjam/saml"
+	"github.com/crewjam/saml/x/samlsp"
+)
+
+// signedIDPMetadata returns ti's metadata, signed by ti's key.
+func signedIDPMetadata(t *testing.T, ti *testIDP) []byte {
+	t.Helper()
+	el, err := ti.idp.SignedMetadata()
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := etree.NewDocument()
+	doc.SetRoot(el)
+	buf, err := doc.WriteToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return buf
+}
+
+// signedAggregate returns an EntitiesDescriptor of entities, signed with key.
+func signedAggregate(t *testing.T, key *rsa.PrivateKey, cert *x509.Certificate, entities ...*saml.EntityDescriptor) []byte {
+	t.Helper()
+	return signedAggregateWith(t, dsig.RSASHA256SignatureMethod, key, cert, entities...)
+}
+
+// signedAggregateWith is signedAggregate, signed with method.
+func signedAggregateWith(t *testing.T, method string, key *rsa.PrivateKey, cert *x509.Certificate, entities ...*saml.EntityDescriptor) []byte {
+	t.Helper()
+	id := "id-aggregate"
+	agg := saml.EntitiesDescriptor{ID: &id}
+	for _, e := range entities {
+		agg.EntityDescriptors = append(agg.EntityDescriptors, *e)
+	}
+	buf, err := xml.Marshal(agg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := etree.NewDocument()
+	if err := doc.ReadFromBytes(buf); err != nil {
+		t.Fatal(err)
+	}
+	signer := dsig.NewDefaultSigningContext(dsig.TLSCertKeyStore{PrivateKey: key, Certificate: [][]byte{cert.Raw}})
+	signer.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList("")
+	if err := signer.SetSignatureMethod(method); err != nil {
+		t.Fatal(err)
+	}
+	signed, err := signer.SignEnveloped(doc.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := etree.NewDocument()
+	out.SetRoot(signed)
+	b, err := out.WriteToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestSignedMetadata(t *testing.T) {
+	ti := newTestIDP(t)
+	signed := signedIDPMetadata(t, ti)
+	unsigned, err := xml.Marshal(ti.idp.Metadata())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherCert := newKeyPair(t, "other")
+	// Tampered: the SSO location changed after signing.
+	tampered := []byte(strings.Replace(string(signed), "https://idp.example.com/sso", "https://evil.example.com/sso", 1))
+	if string(tampered) == string(signed) {
+		t.Fatal("the test did not tamper with the metadata")
+	}
+
+	for _, tt := range []struct {
+		name  string
+		data  []byte
+		certs []*x509.Certificate
+		ok    bool
+	}{
+		{"signed, right certificate", signed, []*x509.Certificate{ti.cert}, true},
+		{"signed, one of several certificates", signed, []*x509.Certificate{otherCert, ti.cert}, true},
+		{"signed, wrong certificate", signed, []*x509.Certificate{otherCert}, false},
+		{"unsigned", unsigned, []*x509.Certificate{ti.cert}, false},
+		{"tampered", tampered, []*x509.Certificate{ti.cert}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			check := func(f samlsp.MetadataFunc) {
+				t.Helper()
+				md, err := f(t.Context())
+				if tt.ok && (err != nil || md.EntityID != "https://idp.example.com/metadata") {
+					t.Errorf("got %v, %v", md, err)
+				}
+				if !tt.ok && err == nil {
+					t.Error("accepted")
+				}
+			}
+			check(samlsp.StaticMetadataBytes(tt.data, samlsp.WithMetadataSigners(tt.certs...)))
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(tt.data) }))
+			defer srv.Close()
+			check(samlsp.RemoteMetadata(srv.URL, samlsp.WithHTTPClient(srv.Client()), samlsp.WithMetadataSigners(tt.certs...),
+				samlsp.WithIdentityProviderEntityID("https://idp.example.com/metadata")))
+			check(samlsp.MDQMetadata(srv.URL, "https://idp.example.com/metadata",
+				samlsp.WithHTTPClient(srv.Client()), samlsp.WithMetadataSigners(tt.certs...)))
+		})
+	}
+
+	// A Config with signed metadata that fails refuses to build requests.
+	cfg := newTestConfigWithIDP(t, ti, samlsp.StaticMetadataBytes(signed, samlsp.WithMetadataSigners(otherCert)))
+	if _, err := cfg.AuthnRequest(t.Context(), "s"); err == nil {
+		t.Error("AuthnRequest with metadata signed by an untrusted key")
+	}
+}
+
+func TestSignedAggregate(t *testing.T) {
+	ti := newTestIDP(t)
+	other := newTestIDP(t)
+	other.idp.MetadataURL = mustURL("https://idp2.example.com/metadata")
+	fedKey, fedCert := newKeyPair(t, "federation")
+	_, wrongCert := newKeyPair(t, "wrong")
+	agg := signedAggregate(t, fedKey, fedCert, ti.idp.Metadata(), other.idp.Metadata())
+
+	// The entity asked for, under the federation's signature.
+	md, err := samlsp.StaticMetadataBytes(agg,
+		samlsp.WithIdentityProviderEntityID("https://idp2.example.com/metadata"),
+		samlsp.WithMetadataSigners(fedCert))(t.Context())
+	if err != nil || md.EntityID != "https://idp2.example.com/metadata" {
+		t.Fatalf("got %v, %v", md, err)
+	}
+
+	for name, f := range map[string]samlsp.MetadataFunc{
+		"wrong certificate": samlsp.StaticMetadataBytes(agg,
+			samlsp.WithIdentityProviderEntityID("https://idp2.example.com/metadata"), samlsp.WithMetadataSigners(wrongCert)),
+		"unknown entity": samlsp.StaticMetadataBytes(agg,
+			samlsp.WithIdentityProviderEntityID("https://idp3.example.com/metadata"), samlsp.WithMetadataSigners(fedCert)),
+		// Two IdPs, and no entity ID to choose one.
+		"no entity ID": samlsp.StaticMetadataBytes(agg, samlsp.WithMetadataSigners(fedCert)),
+	} {
+		if _, err := f(t.Context()); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	_, err = samlsp.StaticMetadataBytes(agg, samlsp.WithMetadataSigners(fedCert))(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "WithIdentityProviderEntityID") {
+		t.Errorf("the error for several IdPs does not name the option: %v", err)
+	}
+}
+
+// Metadata signed with SHA-1 is refused, as protocol messages signed with
+// it are.
+func TestSignedMetadataRefusesSHA1(t *testing.T) {
+	ti := newTestIDP(t)
+	key, cert := newKeyPair(t, "federation")
+	sha1 := signedAggregateWith(t, dsig.RSASHA1SignatureMethod, key, cert, ti.idp.Metadata())
+	if !strings.Contains(string(sha1), dsig.RSASHA1SignatureMethod) {
+		t.Fatal("the test did not sign with SHA-1")
+	}
+	_, err := samlsp.ParseMetadata(sha1, samlsp.WithMetadataSigners(cert))
+	if !errors.Is(err, saml.ErrUnsupported) {
+		t.Fatalf("got %v, want saml.ErrUnsupported", err)
+	}
+	sha256 := signedAggregateWith(t, dsig.RSASHA256SignatureMethod, key, cert, ti.idp.Metadata())
+	if _, err := samlsp.ParseMetadata(sha256, samlsp.WithMetadataSigners(cert)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// With signers, the signature alone vouches for fetched metadata, so
+// RemoteMetadata pins the entity and refuses metadata without a validUntil,
+// which an attacker on the network path could otherwise replace with
+// another signed entity or an old signed copy.
+func TestRemoteSignedMetadataPinned(t *testing.T) {
+	ti := newTestIDP(t)
+	other := newTestIDP(t)
+	other.idp.MetadataURL = mustURL("https://idp2.example.com/metadata")
+	fedKey, fedCert := newKeyPair(t, "federation")
+	serve := func(data []byte) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(data) }))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	// Another entity the federation signed, served in place of the IdP.
+	srv := serve(signedAggregate(t, fedKey, fedCert, other.idp.Metadata()))
+	if _, err := samlsp.RemoteMetadata(srv.URL, samlsp.WithHTTPClient(srv.Client()), samlsp.WithMetadataSigners(fedCert))(t.Context()); err == nil || !strings.Contains(err.Error(), "WithIdentityProviderEntityID") {
+		t.Errorf("without an entity ID: %v", err)
+	}
+	if _, err := samlsp.RemoteMetadata(srv.URL, samlsp.WithHTTPClient(srv.Client()), samlsp.WithMetadataSigners(fedCert),
+		samlsp.WithIdentityProviderEntityID("https://idp.example.com/metadata"))(t.Context()); err == nil || !strings.Contains(err.Error(), "idp.example.com") {
+		t.Errorf("another signed entity in place of the IdP: %v", err)
+	}
+
+	// Signed metadata without a validUntil.
+	md := ti.idp.Metadata()
+	md.ValidUntil = time.Time{}
+	for i := range md.IDPSSODescriptors {
+		md.IDPSSODescriptors[i].ValidUntil = nil
+	}
+	srv = serve(signedAggregate(t, fedKey, fedCert, md))
+	opts := []samlsp.MetadataOption{samlsp.WithMetadataSigners(fedCert), samlsp.WithIdentityProviderEntityID("https://idp.example.com/metadata")}
+	if _, err := samlsp.RemoteMetadata(srv.URL, append(opts, samlsp.WithHTTPClient(srv.Client()))...)(t.Context()); err == nil || !strings.Contains(err.Error(), "validUntil") {
+		t.Errorf("without a validUntil: %v", err)
+	}
+	// It is still accepted from a file, which no one on the network can
+	// replay.
+	if _, err := samlsp.StaticMetadataBytes(signedAggregate(t, fedKey, fedCert, md), opts...)(t.Context()); err != nil {
+		t.Errorf("StaticMetadataBytes: %v", err)
+	}
+}

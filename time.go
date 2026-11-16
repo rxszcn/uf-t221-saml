@@ -1,0 +1,79 @@
+package saml
+
+import "time"
+
+// RelaxedTime is a version of time.Time that supports the time format
+// found in SAML documents.
+//
+// saml-core §1.3.3 says SAML time values "MUST be expressed in UTC form,
+// with no time zone component". Read literally, that is an xs:dateTime with
+// no zone designator at all; most implementations write a trailing "Z"
+// instead. UnmarshalText accepts both, reading a time with no zone as UTC,
+// and also accepts a numeric offset, converting the time to UTC; MarshalText
+// always writes UTC with "Z". TestConformanceDeviation_TimeZone pins this.
+type RelaxedTime time.Time
+
+const timeFormat = "2006-01-02T15:04:05.999Z07:00"
+
+// formatTime formats t for a SAML message. saml-core §1.3.3 says SAML time
+// values "MUST be expressed in UTC form, with no time zone component", so t
+// is converted to UTC first; a time in another zone would otherwise keep
+// its offset. Fractions finer than a millisecond are dropped.
+func formatTime(t time.Time) string {
+	return t.UTC().Format(timeFormat)
+}
+
+// optionalRelaxedTime returns t as a *RelaxedTime, or nil if t is the zero
+// time. It is used for optional time attributes, so that MarshalXML leaves
+// out an unset time as Element does, instead of writing
+// "0001-01-01T00:00:00Z" (which reads as long expired).
+func optionalRelaxedTime(t time.Time) *RelaxedTime {
+	if t.IsZero() {
+		return nil
+	}
+	rt := RelaxedTime(t)
+	return &rt
+}
+
+// MarshalText implements encoding.TextMarshaler
+func (m RelaxedTime) MarshalText() ([]byte, error) {
+	// According to section 1.2.2 of the OASIS SAML 1.1 spec, we can't trust
+	// other applications to handle time resolution finer than a millisecond.
+	//
+	// The time MUST be expressed in UTC.
+	return []byte(m.String()), nil
+}
+
+func (m RelaxedTime) String() string {
+	return time.Time(m).Round(time.Millisecond).UTC().Format(timeFormat)
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler
+func (m *RelaxedTime) UnmarshalText(text []byte) error {
+	if len(text) == 0 {
+		*m = RelaxedTime(time.Time{})
+		return nil
+	}
+	t, err1 := time.Parse(time.RFC3339, string(text))
+	if err1 == nil {
+		t = t.Round(time.Millisecond)
+		*m = RelaxedTime(t)
+		return nil
+	}
+
+	t, err2 := time.Parse(time.RFC3339Nano, string(text))
+	if err2 == nil {
+		t = t.Round(time.Millisecond)
+		*m = RelaxedTime(t)
+		return nil
+	}
+
+	t, err2 = time.Parse("2006-01-02T15:04:05.999999999", string(text))
+	if err2 == nil {
+		t = t.Round(time.Millisecond)
+		*m = RelaxedTime(t)
+		return nil
+	}
+
+	return err1
+}

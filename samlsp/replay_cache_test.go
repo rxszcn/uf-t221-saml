@@ -162,41 +162,61 @@ func TestNewPassesReplayCache(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Check(t, m.ServiceProvider.ReplayCache == saml.AssertionReplayCache(cache))
 
+	// Without Options.ReplayCache, New wires a MemoryReplayCache: replay
+	// protection is on by default and cannot silently be absent.
 	m, err = New(Options{URL: mustParseURL("https://sp.example.com/")})
 	assert.NilError(t, err)
-	assert.Check(t, is.Nil(m.ServiceProvider.ReplayCache))
+	assert.Check(t, m.ServiceProvider.ReplayCache != nil)
 }
 
-// With Options.ReplayCache set, the ACS accepts a response once and refuses
-// the same response again.
+// The ACS accepts a response once and refuses the same response again, with
+// the default Options as with an explicit Options.ReplayCache, and the error
+// passed to OnError identifies the replay.
 func TestMiddlewareRefusesReplayedResponse(t *testing.T) {
-	test := NewMiddlewareTest(t)
-	m, err := New(Options{
-		URL:         mustParseURL("https://15661444.ngrok.io/"),
-		Key:         test.Key,
-		Certificate: test.Certificate,
-		IDPMetadata: test.Middleware.ServiceProvider.IDPMetadata,
-		ReplayCache: NewMemoryReplayCache(10),
-	})
-	assert.NilError(t, err)
-	m.ServiceProvider.MetadataURL.Path = "/saml2/metadata"
-	m.ServiceProvider.AcsURL.Path = "/saml2/acs"
-	m.ServiceProvider.SloURL.Path = "/saml2/slo"
-	test.Middleware = m
+	for _, tc := range []struct {
+		name        string
+		replayCache saml.AssertionReplayCache // nil: the default Options
+	}{
+		{name: "default Options"},
+		{name: "explicit ReplayCache", replayCache: NewMemoryReplayCache(10)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			test := NewMiddlewareTest(t)
+			m, err := New(Options{
+				URL:         mustParseURL("https://15661444.ngrok.io/"),
+				Key:         test.Key,
+				Certificate: test.Certificate,
+				IDPMetadata: test.Middleware.ServiceProvider.IDPMetadata,
+				ReplayCache: tc.replayCache,
+			})
+			assert.NilError(t, err)
+			m.ServiceProvider.MetadataURL.Path = "/saml2/metadata"
+			m.ServiceProvider.AcsURL.Path = "/saml2/acs"
+			m.ServiceProvider.SloURL.Path = "/saml2/slo"
+			test.Middleware = m
 
-	post := func() int {
-		v := url.Values{}
-		v.Set("SAMLResponse", base64.StdEncoding.EncodeToString(test.SamlResponse))
-		v.Set("RelayState", "KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6")
-		req, _ := http.NewRequest("POST", "/saml2/acs", bytes.NewReader([]byte(v.Encode())))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		req.Header.Set("Cookie", ""+
-			"saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-9e61753d64e928af5a7a341a97f420c9"))
-		resp := httptest.NewRecorder()
-		m.ServeHTTP(resp, req)
-		return resp.Code
+			var gotErr error
+			m.OnError = func(w http.ResponseWriter, _ *http.Request, err error) {
+				gotErr = err
+				http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			}
+
+			post := func() int {
+				v := url.Values{}
+				v.Set("SAMLResponse", base64.StdEncoding.EncodeToString(test.SamlResponse))
+				v.Set("RelayState", "KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6")
+				req, _ := http.NewRequest("POST", "/saml2/acs", bytes.NewReader([]byte(v.Encode())))
+				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+				req.Header.Set("Cookie", ""+
+					"saml_KCosLjAyNDY4Ojw-QEJERkhKTE5QUlRWWFpcXmBiZGZoamxucHJ0dnh6="+test.makeTrackedRequest("id-9e61753d64e928af5a7a341a97f420c9"))
+				resp := httptest.NewRecorder()
+				m.ServeHTTP(resp, req)
+				return resp.Code
+			}
+
+			assert.Check(t, is.Equal(http.StatusFound, post()))
+			assert.Check(t, is.Equal(http.StatusForbidden, post()))
+			assert.Check(t, is.ErrorIs(gotErr, saml.ErrAssertionReplayed))
+		})
 	}
-
-	assert.Check(t, is.Equal(http.StatusFound, post()))
-	assert.Check(t, is.Equal(http.StatusForbidden, post()))
 }

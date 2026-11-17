@@ -15,6 +15,17 @@ import (
 // maximum number of unexpired assertion IDs. The assertion is refused.
 var ErrReplayCacheFull = errors.New("samlsp: replay cache is full")
 
+// DefaultMaxReplayCacheEntries is the capacity of the MemoryReplayCache that
+// DefaultServiceProvider wires when Options.ReplayCache is nil. An ID is
+// kept for at most saml.MaxIssueDelay plus saml.MaxClockSkew (about five
+// minutes with the package defaults), so the capacity bounds the logins one
+// process can accept in that period: 10000 is far above the login rate of a
+// typical SP, at roughly a megabyte of memory. A full cache refuses logins
+// with ErrReplayCacheFull rather than dropping an unexpired ID (see
+// MemoryReplayCache), so a deployment whose login rate could exceed it must
+// set Options.ReplayCache to a larger or shared cache.
+const DefaultMaxReplayCacheEntries = 10000
+
 // MemoryReplayCache is a saml.AssertionReplayCache that keeps the IDs of
 // accepted assertions in memory, each until the expiry it was recorded with.
 // It is safe for concurrent use.

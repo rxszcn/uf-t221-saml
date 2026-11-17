@@ -240,10 +240,11 @@ func TestFormReplayAfterLogin(t *testing.T) {
 	// the session is created as usual
 	assert.Check(t, is.Contains(strings.Join(resp.Header()["Set-Cookie"], "\n"), "ttt="+test.expectedSessionCookie))
 
-	// the form is replayed once only
+	// the same Response is not accepted a second time: the replay cache that
+	// the default Options wire refuses it before the saved form is considered
 	resp = httptest.NewRecorder()
 	test.Middleware.ServeHTTP(resp, test.acsRequest(t, uri))
-	assert.Check(t, is.Equal(http.StatusFound, resp.Code))
+	assert.Check(t, is.Equal(http.StatusForbidden, resp.Code))
 }
 
 func TestFormReplayScriptNonce(t *testing.T) {

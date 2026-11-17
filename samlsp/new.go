@@ -212,10 +212,16 @@ type Options struct {
 	// requests.
 	SessionKey crypto.Signer
 
-	// ReplayCache, if set, records the ID of each accepted assertion and
-	// refuses an assertion it has already recorded. See
-	// saml.ServiceProvider.ReplayCache. NewMemoryReplayCache returns one for
-	// a single process. If nil, assertions are not checked for replay.
+	// ReplayCache records the ID of each accepted assertion and refuses an
+	// assertion it has already recorded. See saml.ServiceProvider.ReplayCache.
+	//
+	// If nil, DefaultServiceProvider wires a MemoryReplayCache of
+	// DefaultMaxReplayCacheEntries entries, so that a Response cannot be
+	// replayed by default. That cache serves a single process only: an
+	// assertion accepted by another process, or before a restart, is not
+	// known to it. Applications served by several processes must set a cache
+	// the processes share. To turn replay checking off, set
+	// ServiceProvider.ReplayCache to nil on the Middleware that New returns.
 	ReplayCache saml.AssertionReplayCache
 
 	// SessionRevocations, if set, is where the default session provider
@@ -383,7 +389,8 @@ func DefaultLogoutRequestTracker(opts Options, serviceProvider *saml.ServiceProv
 }
 
 // DefaultServiceProvider returns the default saml.ServiceProvider for the provided
-// options.
+// options. Its ReplayCache is opts.ReplayCache or, if that is nil, a new
+// MemoryReplayCache of DefaultMaxReplayCacheEntries entries.
 func DefaultServiceProvider(opts Options) saml.ServiceProvider {
 	metadataURL := opts.URL.ResolveReference(&url.URL{Path: pathOrDefault(opts.MetadataPath, "saml/metadata")})
 	acsURL := opts.URL.ResolveReference(&url.URL{Path: pathOrDefault(opts.AcsPath, "saml/acs")})
@@ -413,6 +420,18 @@ func DefaultServiceProvider(opts Options) saml.ServiceProvider {
 
 	if opts.UseSimpleSignResponse && len(opts.AssertionConsumerServiceBindings) == 0 {
 		opts.AssertionConsumerServiceBindings = []string{saml.HTTPPostSimpleSignBinding, saml.HTTPPostBinding}
+	}
+
+	// Replay protection is on by default, as it is in x/samlsp: without a
+	// cache the same signed Response would start a session every time it is
+	// posted. The default cache is built here, not in New, so that callers
+	// of DefaultServiceProvider get it too; like the default
+	// SessionRevocations store, it serves a single process only.
+	replayCache := opts.ReplayCache
+	if replayCache == nil {
+		cache := NewMemoryReplayCache(DefaultMaxReplayCacheEntries)
+		cache.Clock = opts.Clock
+		replayCache = cache
 	}
 
 	return saml.ServiceProvider{
@@ -445,7 +464,7 @@ func DefaultServiceProvider(opts Options) saml.ServiceProvider {
 		RejectExpiredIDPMetadata:         opts.RejectExpiredIDPMetadata,
 		SignMetadata:                     opts.SignMetadata,
 		RequireStandardArtifacts:         opts.RequireStandardArtifacts,
-		ReplayCache:                      opts.ReplayCache,
+		ReplayCache:                      replayCache,
 		Clock:                            opts.Clock,
 	}
 }

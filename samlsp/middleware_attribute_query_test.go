@@ -188,15 +188,18 @@ func (lt *logoutTest) attributeQueryResponse(t *testing.T, query *saml.Attribute
 	}
 	issuer := &saml.Issuer{Value: logoutTestIDPEntityID}
 	nameID := *query.Subject.NameID
+	// The response and assertion IDs derive from the query's, so each answer
+	// is unique, as a real authority's would be: the SP records the IDs of
+	// the assertions it accepts in its replay cache.
 	response := &saml.Response{
-		ID:           "id-attribute-response",
+		ID:           "id-attribute-response-" + query.ID,
 		InResponseTo: query.ID,
 		Version:      "2.0",
 		IssueInstant: logoutTestNow,
 		Issuer:       issuer,
 		Status:       saml.Status{StatusCode: saml.StatusCode{Value: saml.StatusSuccess}},
 		Assertion: &saml.Assertion{
-			ID:           "id-attribute-assertion",
+			ID:           "id-attribute-assertion-" + query.ID,
 			Version:      "2.0",
 			IssueInstant: logoutTestNow,
 			Issuer:       *issuer,

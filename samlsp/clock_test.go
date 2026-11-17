@@ -38,6 +38,7 @@ func TestOptionsClockIsPropagated(t *testing.T) {
 	assert.Check(t, sessions.Revocations.(*MemorySessionRevocationStore).Clock == clock)
 	assert.Check(t, m.RequestTracker.(CookieRequestTracker).Codec.(JWTTrackedRequestCodec).Clock == clock)
 	assert.Check(t, m.LogoutRequestTracker.(CookieRequestTracker).Codec.(JWTTrackedRequestCodec).Clock == clock)
+	assert.Check(t, m.ServiceProvider.ReplayCache.(*MemoryReplayCache).Clock == clock)
 }
 
 func TestJWTSessionCodecClock(t *testing.T) {
